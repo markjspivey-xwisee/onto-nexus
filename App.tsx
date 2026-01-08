@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Globe, 
   Activity, 
@@ -15,12 +15,28 @@ import {
   X,
   ExternalLink,
   Target,
-  Zap
+  Zap,
+  Filter,
+  Eye,
+  EyeOff,
+  ScanSearch,
+  Code
 } from 'lucide-react';
 import KnowledgeGraph from './components/KnowledgeGraph';
 import SituationPanel from './components/SituationPanel';
-import { fetchGlobalIntel, extractKnowledgeGraph, generateSituationReport } from './services/geminiService';
-import { NewsArticle, KnowledgeGraphData, Alert, ONTOLOGY_PREFIXES, GraphNode } from './types';
+import { fetchGlobalIntel, extractKnowledgeGraph, generateSituationReport, generateOntologyLayer, performShaclScan, generateDomainOntology } from './services/geminiService';
+import { NewsArticle, KnowledgeGraphData, Alert, ONTOLOGY_PREFIXES, GraphNode, NodeType, GraphLink } from './types';
+
+// Pre-seeded Upper Ontology Classes to ensure T-Box First connectivity
+const STANDARD_CLASSES: GraphNode[] = [
+  { id: 'Person', label: 'Person', type: NodeType.Class, x: 0, y: 0 },
+  { id: 'Organization', label: 'Organization', type: NodeType.Class, x: 0, y: 0 },
+  { id: 'Location', label: 'Location', type: NodeType.Class, x: 0, y: 0 },
+  { id: 'Event', label: 'Event', type: NodeType.Class, x: 0, y: 0 },
+  { id: 'Concept', label: 'Concept', type: NodeType.Class, x: 0, y: 0 },
+  { id: 'Document', label: 'Document', type: NodeType.Class, x: 0, y: 0 },
+  { id: 'Artifact', label: 'Artifact', type: NodeType.Class, x: 0, y: 0 },
+];
 
 const App: React.FC = () => {
   // State
@@ -29,15 +45,25 @@ const App: React.FC = () => {
   const [graphData, setGraphData] = useState<KnowledgeGraphData>({ nodes: [], links: [] });
   const [loading, setLoading] = useState(false);
   
-  // Track which articles are currently being processed
+  // Filtering & Search
+  const [searchTerm, setSearchTerm] = useState('');
+  const [nodeTypeFilter, setNodeTypeFilter] = useState<NodeType | 'ALL'>('ALL');
+  const [showOntology, setShowOntology] = useState(true); 
+  
+  // SHACL & Agents
+  const [shaclQuery, setShaclQuery] = useState('');
+  const [isShaclScanning, setIsShaclScanning] = useState(false);
+
+  // Track processing
   const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
   
   const [alerts, setAlerts] = useState<Alert[]>([]);
-  const [activeTab, setActiveTab] = useState<'graph' | 'ontology'>('graph');
+  const [activeTab, setActiveTab] = useState<'graph' | 'ontology' | 'shacl'>('graph');
   
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [sitRep, setSitRep] = useState<string | null>(null);
   const [generatingSitRep, setGeneratingSitRep] = useState(false);
+  const [ontologyLoaded, setOntologyLoaded] = useState(false);
 
   // Initial Data Load
   useEffect(() => {
@@ -45,19 +71,39 @@ const App: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Handlers
+  // -- MAIN LOGIC HANDLERS --
+
   const loadIntel = async (customTopic?: string) => {
     setLoading(true);
-    setProcessingIds(new Set()); // Reset processing state
+    setProcessingIds(new Set());
+    // Pre-seed with Standard Upper Ontology to ensure SHACL/Feed items always have a parent Class to link to
+    setGraphData({ nodes: [...STANDARD_CLASSES], links: [] });
+    setSitRep(null);
+    setOntologyLoaded(false);
     
+    const targetTopic = customTopic || topic || "Global Situation";
+
     try {
-      const news = await fetchGlobalIntel(customTopic || topic);
-      setArticles(news);
-      addAlert('System', `Intel feed updated. ${customTopic ? `Topic: ${customTopic}` : 'Global scan.'}`, 'info');
+      // 1. Generate Domain T-Box First (Ontology Driven)
+      addAlert('OntologyAgent', `Generating Domain Ontology for: ${targetTopic}...`, 'info');
+      const tBox = await generateDomainOntology(targetTopic);
+      if (tBox.nodes.length > 0) {
+        mergeGraphData(tBox.nodes, tBox.links);
+        setOntologyLoaded(true);
+      }
       
-      // Real-time Background Mapping Queue
-      // We process them one by one with a slight delay to look cool and avoid rate limits
-      processBackgroundQueue(news);
+      // Combine standard classes with generated ones for context
+      const ontologyClassIds = [...STANDARD_CLASSES, ...tBox.nodes]
+        .filter(n => n.type === NodeType.Class)
+        .map(n => n.id);
+
+      // 2. Fetch A-Box Feed
+      const news = await fetchGlobalIntel(targetTopic);
+      setArticles(news);
+      addAlert('System', `Intel feed updated. Processing ${news.length} signals.`, 'info');
+      
+      // 3. Process
+      processBackgroundQueue(news, ontologyClassIds);
 
     } catch (e) {
       console.error(e);
@@ -67,49 +113,27 @@ const App: React.FC = () => {
     }
   };
 
-  const processBackgroundQueue = async (items: NewsArticle[]) => {
+  const processBackgroundQueue = async (items: NewsArticle[], ontologyContext: string[]) => {
     for (let i = 0; i < items.length; i++) {
       const article = items[i];
-      // Small delay for visual effect
       await new Promise(r => setTimeout(r, i === 0 ? 0 : 2000)); 
-      
-      // Trigger analysis
-      analyzeArticle(article);
+      analyzeArticle(article, ontologyContext);
     }
   };
 
-  const analyzeArticle = async (article: NewsArticle) => {
-    // Add to processing set
+  const analyzeArticle = async (article: NewsArticle, ontologyContext: string[]) => {
     setProcessingIds(prev => new Set(prev).add(article.id));
-    
     try {
-      const kg = await extractKnowledgeGraph(article.summary);
-      
-      if (!kg || !kg.nodes || !kg.links) {
-        throw new Error("Received malformed knowledge graph data");
+      const kg = await extractKnowledgeGraph(article.summary, ontologyContext);
+      if (kg && kg.nodes) {
+        const added = mergeGraphData(kg.nodes, kg.links || []);
+        if (added) {
+          addAlert('OntologyAgent', `Mapped: ${article.title.substring(0, 20)}...`, 'info');
+        }
       }
-
-      // Merge new nodes/links
-      setGraphData(prev => {
-        const newNodes = kg.nodes.filter(n => !prev.nodes.find(pn => pn.id === n.id));
-        // Add coordinates to new nodes to prevent them from spawning at (0,0) and exploding
-        // random position near center
-        newNodes.forEach(n => {
-           n.x = 400 + (Math.random() - 0.5) * 50;
-           n.y = 300 + (Math.random() - 0.5) * 50;
-        });
-
-        return {
-          nodes: [...prev.nodes, ...newNodes],
-          links: [...prev.links, ...kg.links.map(l => ({...l}))]
-        };
-      });
-      addAlert('OntologyAgent', `Mapped: ${article.title.substring(0, 20)}...`, 'info');
     } catch (e) {
       console.error(e);
-      // addAlert('System', 'Semantic extraction failed.', 'error'); // Keep quiet on failure to not spam
     } finally {
-      // Remove from processing set
       setProcessingIds(prev => {
         const next = new Set(prev);
         next.delete(article.id);
@@ -117,6 +141,95 @@ const App: React.FC = () => {
       });
     }
   };
+
+  const mergeGraphData = (newNodes: GraphNode[], newLinks: GraphLink[] = []): boolean => {
+    let hasChanges = false;
+    
+    setGraphData(prev => {
+      // 1. Filter Nodes
+      const existingIds = new Set(prev.nodes.map(n => n.id));
+      const uniqueNewNodes = newNodes.filter(n => !existingIds.has(n.id));
+      
+      // Initialize positions for new nodes to prevent explosion
+      uniqueNewNodes.forEach(n => {
+         n.x = 400 + (Math.random() - 0.5) * 50;
+         n.y = 300 + (Math.random() - 0.5) * 50;
+      });
+
+      // 2. Filter Links (prevent duplicates)
+      const existingLinkSigs = new Set(prev.links.map(l => {
+          const s = typeof l.source === 'object' ? (l.source as any).id : l.source;
+          const t = typeof l.target === 'object' ? (l.target as any).id : l.target;
+          return `${s}-${t}-${l.predicate}`;
+      }));
+
+      const safeLinks = Array.isArray(newLinks) ? newLinks : [];
+      const uniqueNewLinks = safeLinks.filter(l => {
+          const s = typeof l.source === 'object' ? (l.source as any).id : l.source;
+          const t = typeof l.target === 'object' ? (l.target as any).id : l.target;
+          return !existingLinkSigs.has(`${s}-${t}-${l.predicate}`);
+      });
+
+      // 3. Early Exit if no updates (Prevents D3 "Jerking")
+      if (uniqueNewNodes.length === 0 && uniqueNewLinks.length === 0) {
+        return prev;
+      }
+      
+      hasChanges = true;
+
+      return {
+        nodes: [...prev.nodes, ...uniqueNewNodes],
+        links: [...prev.links, ...uniqueNewLinks]
+      };
+    });
+    
+    return hasChanges;
+  };
+
+  // -- ONTOLOGY LAYER LOGIC --
+
+  const toggleOntologyLayer = async () => {
+    if (!showOntology && !ontologyLoaded && graphData.nodes.length > 0) {
+      // If we somehow didn't generate it at start (fallback)
+      addAlert('OntologyAgent', 'Inferring T-Box Classes from current instance data...', 'warning');
+      try {
+        const tBox = await generateOntologyLayer(graphData.nodes);
+        mergeGraphData(tBox.nodes, tBox.links);
+        setOntologyLoaded(true);
+        addAlert('OntologyAgent', 'Ontology Layer mapped.', 'info');
+      } catch (e) {
+        addAlert('OntologyAgent', 'Failed to generate Ontology Layer.', 'error');
+      }
+    }
+    setShowOntology(!showOntology);
+  };
+
+  // -- SHACL SCAN LOGIC --
+
+  const handleShaclScan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!shaclQuery.trim()) return;
+    
+    setIsShaclScanning(true);
+    addAlert('SHACL Agent', `Scanning web for pattern: "${shaclQuery}"`, 'warning');
+    
+    try {
+      const result = await performShaclScan(shaclQuery);
+      if (result.nodes.length > 0) {
+        mergeGraphData(result.nodes, result.links);
+        addAlert('SHACL Agent', `Found ${result.nodes.length} entities matching pattern.`, 'info');
+        setActiveTab('graph'); // Switch to graph to see results
+      } else {
+        addAlert('SHACL Agent', 'No matching patterns found on open web.', 'warning');
+      }
+    } catch (e) {
+      addAlert('SHACL Agent', 'Pattern scan failed.', 'error');
+    } finally {
+      setIsShaclScanning(false);
+    }
+  };
+
+  // -- HELPER FUNCTIONS --
 
   const handleGenerateSitRep = async () => {
     if (graphData.nodes.length === 0) return;
@@ -154,7 +267,6 @@ const App: React.FC = () => {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    addAlert('System', 'Knowledge Graph exported as JSON-LD.', 'info');
   };
 
   const addAlert = (sender: string, message: string, severity: 'info' | 'warning' | 'error') => {
@@ -169,6 +281,26 @@ const App: React.FC = () => {
     loadIntel(topic);
   };
 
+  // Filter the graph data for rendering
+  const filteredNodes = graphData.nodes.filter(node => {
+    // 1. Filter by Ontology toggle
+    if (!showOntology && node.type === NodeType.Class) return false;
+    // 2. Filter by Node Type dropdown
+    if (nodeTypeFilter !== 'ALL' && node.type !== nodeTypeFilter) return false;
+    return true;
+  });
+
+  const filteredLinks = graphData.links.filter(link => {
+    const sourceId = typeof link.source === 'object' ? (link.source as any).id : link.source;
+    const targetId = typeof link.target === 'object' ? (link.target as any).id : link.target;
+    
+    // Check if source/target exist in filteredNodes
+    const sourceExists = filteredNodes.find(n => n.id === sourceId);
+    const targetExists = filteredNodes.find(n => n.id === targetId);
+    
+    return sourceExists && targetExists;
+  });
+
   return (
     <div className="flex h-screen bg-slate-950 text-slate-200 overflow-hidden font-sans">
       
@@ -178,7 +310,7 @@ const App: React.FC = () => {
           <h1 className="text-lg font-bold text-blue-400 flex items-center gap-2">
             <Globe className="text-blue-500" /> ONTO-NEXUS
           </h1>
-          <p className="text-xs text-slate-500 font-mono mt-1">v3.6.0 [CAUSAL ENGINE]</p>
+          <p className="text-xs text-slate-500 font-mono mt-1">v4.1.0 [T-BOX FIRST]</p>
         </div>
         
         <div className="flex-1 overflow-y-auto p-4">
@@ -225,7 +357,13 @@ const App: React.FC = () => {
               onClick={() => setActiveTab('graph')}
               className={`flex items-center gap-2 px-3 py-1.5 rounded text-sm transition-colors ${activeTab === 'graph' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}
             >
-              <Share2 size={16} /> Knowledge Graph
+              <Share2 size={16} /> Graph
+            </button>
+            <button 
+              onClick={() => setActiveTab('shacl')}
+              className={`flex items-center gap-2 px-3 py-1.5 rounded text-sm transition-colors ${activeTab === 'shacl' ? 'bg-purple-600 text-white' : 'text-slate-400 hover:bg-slate-800'}`}
+            >
+              <ScanSearch size={16} /> SHACL Studio
             </button>
             <button 
               onClick={() => setActiveTab('ontology')}
@@ -267,7 +405,8 @@ const App: React.FC = () => {
           
           {/* Feed Column */}
           <div className="bg-slate-900 border border-slate-700 rounded-lg flex flex-col h-full lg:col-span-1">
-            <div className="p-3 border-b border-slate-700 bg-slate-950 flex justify-between items-center">
+             {/* Feed is only visible on large screens or if not in SHACL mode (to save space) */}
+             <div className="p-3 border-b border-slate-700 bg-slate-950 flex justify-between items-center">
               <h2 className="font-bold text-sm text-slate-200 flex items-center gap-2">
                 <Activity size={16} className="text-red-500" /> INTEL FEED
               </h2>
@@ -293,14 +432,6 @@ const App: React.FC = () => {
                   </div>
                   <h3 className="text-sm font-semibold text-slate-100 mb-1 leading-snug">{article.title}</h3>
                   <p className="text-xs text-slate-400 mb-3 line-clamp-2">{article.summary}</p>
-                  
-                  <div className="flex flex-wrap gap-1 mb-3">
-                    {article.semanticTags.map(tag => (
-                      <span key={tag} className="text-[9px] text-purple-300 bg-purple-900/30 px-1 rounded border border-purple-900/50">
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
                   
                   <div className="flex gap-2">
                      <button 
@@ -338,100 +469,193 @@ const App: React.FC = () => {
               {articles.length === 0 && !loading && (
                 <div className="text-center p-8 text-slate-600">
                   <p>No signals detected.</p>
-                  <p className="text-xs mt-2">Enter a topic above or refresh.</p>
                 </div>
               )}
             </div>
           </div>
 
-          {/* Visualization Column */}
+          {/* Visualization / SHACL / Ontology Column */}
           <div className="lg:col-span-2 flex flex-col h-full bg-slate-900 border border-slate-700 rounded-lg overflow-hidden relative">
-            {activeTab === 'graph' ? (
-              <div className="flex-1 relative w-full h-full bg-slate-950">
-                 {/* Graph Overlay UI */}
-                 <div className="absolute top-4 left-4 z-10 pointer-events-none flex gap-2">
-                    <div className="bg-black/50 backdrop-blur p-2 rounded border border-slate-800 text-xs text-slate-300 pointer-events-auto">
-                      <p className="font-bold mb-1">GRAPH VISUALIZATION</p>
-                      <p className="text-slate-500">Real-time Causal Mapping Active</p>
+            
+            {activeTab === 'graph' && (
+              <div className="flex-1 relative w-full h-full bg-slate-950 flex flex-col">
+                 
+                 {/* Graph Toolbar */}
+                 <div className="h-12 border-b border-slate-700 bg-slate-900 flex items-center px-4 gap-4 z-10">
+                    <div className="flex items-center gap-2 flex-1">
+                      <Search size={14} className="text-slate-500" />
+                      <input 
+                        className="bg-transparent border-none focus:outline-none text-xs text-white w-full"
+                        placeholder="Search nodes in graph..."
+                        value={searchTerm}
+                        onChange={(e) => setSearchTerm(e.target.value)}
+                      />
+                    </div>
+                    <div className="h-4 w-px bg-slate-700"></div>
+                    <div className="flex items-center gap-2">
+                       <Filter size={14} className="text-slate-500" />
+                       <select 
+                        value={nodeTypeFilter} 
+                        onChange={(e) => setNodeTypeFilter(e.target.value as NodeType | 'ALL')}
+                        className="bg-slate-800 border-none text-xs text-slate-300 rounded py-1 px-2 focus:ring-0"
+                       >
+                         <option value="ALL">All Types</option>
+                         {Object.values(NodeType).filter(t => t !== NodeType.Class).map(t => (
+                           <option key={t} value={t}>{t}</option>
+                         ))}
+                       </select>
                     </div>
                     <button 
-                      onClick={handleGenerateSitRep}
-                      disabled={generatingSitRep || graphData.nodes.length === 0}
-                      className="pointer-events-auto bg-blue-900/80 backdrop-blur hover:bg-blue-800 border border-blue-700 text-blue-200 px-3 py-2 rounded text-xs font-bold flex items-center gap-2 transition-all shadow-lg shadow-blue-900/20"
+                      onClick={toggleOntologyLayer}
+                      className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs transition-colors border ${
+                        showOntology 
+                        ? 'bg-purple-900/50 border-purple-700 text-purple-200' 
+                        : 'bg-slate-800 border-slate-700 text-slate-400'
+                      }`}
                     >
-                      <BrainCircuit size={14} className={generatingSitRep ? "animate-spin" : ""} />
-                      {generatingSitRep ? "RUNNING CAUSAL SIMULATION..." : "CAUSAL SITREP"}
+                      {showOntology ? <Eye size={12}/> : <EyeOff size={12}/>} Ontology Layer
                     </button>
                  </div>
-                 
-                 {/* SitRep Modal Overlay */}
-                 {sitRep && (
-                   <div className="absolute top-16 left-4 right-4 bottom-4 z-20 bg-slate-900/95 backdrop-blur-md border border-blue-800 rounded p-6 shadow-2xl animate-in fade-in slide-in-from-top-4 overflow-y-auto flex flex-col">
-                     <div className="flex justify-between items-start mb-4 border-b border-blue-900 pb-4">
-                       <h3 className="font-bold text-blue-400 flex items-center gap-2 text-lg">
-                           <BrainCircuit size={20}/> CAUSAL SITUATION REPORT
-                       </h3>
-                       <button onClick={() => setSitRep(null)} className="text-slate-400 hover:text-white p-1 hover:bg-slate-800 rounded"><X size={20}/></button>
-                     </div>
-                     <div className="flex-1 overflow-y-auto">
-                        <div className="prose prose-invert prose-sm max-w-none font-mono whitespace-pre-line">
-                           {sitRep}
-                        </div>
-                     </div>
-                     <div className="mt-4 pt-4 border-t border-slate-800 flex justify-between items-center text-[10px] text-slate-500 font-mono">
-                       <span>FRAMEWORK: JUDEA PEARL (LADDER OF CAUSATION)</span>
-                       <span>GENERATED BY GEMINI-3-FLASH</span>
-                     </div>
-                   </div>
-                 )}
 
-                 {/* Node Inspector Overlay */}
-                 {selectedNode && (
-                   <div className="absolute top-4 right-4 z-20 bg-slate-900/90 backdrop-blur border border-slate-600 rounded p-4 w-64 shadow-xl">
-                      <div className="flex justify-between items-start mb-2">
-                        <span className="text-[10px] font-bold bg-slate-700 px-1 rounded text-slate-300">{selectedNode.type.toUpperCase()}</span>
-                        <button onClick={() => setSelectedNode(null)} className="text-slate-400 hover:text-white"><X size={14}/></button>
-                      </div>
-                      <h3 className="font-bold text-lg text-white mb-2">{selectedNode.label}</h3>
-                      <div className="text-xs text-slate-400 mb-2 font-mono">{selectedNode.id}</div>
-                      
-                      <div className="border-t border-slate-700 pt-2 mt-2">
-                        <h4 className="text-[10px] font-bold text-slate-500 uppercase mb-1">Connections</h4>
-                        <div className="space-y-1 max-h-40 overflow-y-auto">
-                          {graphData.links
-                            .filter(l => (typeof l.source === 'object' ? (l.source as any).id : l.source) === selectedNode.id)
-                            .map((l, i) => (
-                              <div key={i} className="text-[11px] text-slate-300">
-                                <span className="text-purple-400">→ {l.predicate}</span> {(l.target as any).label || l.target}
-                              </div>
-                            ))
-                          }
-                          {graphData.links
-                            .filter(l => (typeof l.target === 'object' ? (l.target as any).id : l.target) === selectedNode.id)
-                            .map((l, i) => (
-                              <div key={i} className="text-[11px] text-slate-300">
-                                <span className="text-green-400">← {l.predicate}</span> {(l.source as any).label || l.source}
-                              </div>
-                            ))
-                          }
-                          {graphData.links.filter(l => (typeof l.source === 'object' ? (l.source as any).id : l.source) === selectedNode.id || (typeof l.target === 'object' ? (l.target as any).id : l.target) === selectedNode.id).length === 0 && 
-                            <span className="text-slate-600 italic text-[11px]">No active links</span>
-                          }
+                 <div className="flex-1 relative">
+                    {/* Graph Overlays */}
+                    <div className="absolute top-4 left-4 z-10 pointer-events-none flex gap-2">
+                        <button 
+                          onClick={handleGenerateSitRep}
+                          disabled={generatingSitRep || graphData.nodes.length === 0}
+                          className="pointer-events-auto bg-blue-900/80 backdrop-blur hover:bg-blue-800 border border-blue-700 text-blue-200 px-3 py-2 rounded text-xs font-bold flex items-center gap-2 transition-all shadow-lg shadow-blue-900/20"
+                        >
+                          <BrainCircuit size={14} className={generatingSitRep ? "animate-spin" : ""} />
+                          {generatingSitRep ? "RUNNING CAUSAL SIMULATION..." : "CAUSAL SITREP"}
+                        </button>
+                    </div>
+
+                    {/* SitRep Modal Overlay */}
+                    {sitRep && (
+                      <div className="absolute top-16 left-4 right-4 bottom-4 z-20 bg-slate-900/95 backdrop-blur-md border border-blue-800 rounded p-6 shadow-2xl animate-in fade-in slide-in-from-top-4 overflow-y-auto flex flex-col">
+                        <div className="flex justify-between items-start mb-4 border-b border-blue-900 pb-4">
+                          <h3 className="font-bold text-blue-400 flex items-center gap-2 text-lg">
+                              <BrainCircuit size={20}/> CAUSAL SITUATION REPORT
+                          </h3>
+                          <button onClick={() => setSitRep(null)} className="text-slate-400 hover:text-white p-1 hover:bg-slate-800 rounded"><X size={20}/></button>
+                        </div>
+                        <div className="flex-1 overflow-y-auto">
+                            <div className="prose prose-invert prose-sm max-w-none font-mono whitespace-pre-line">
+                              {sitRep}
+                            </div>
+                        </div>
+                        <div className="mt-4 pt-4 border-t border-slate-800 flex justify-between items-center text-[10px] text-slate-500 font-mono">
+                          <span>FRAMEWORK: JUDEA PEARL (LADDER OF CAUSATION)</span>
+                          <span>GENERATED BY GEMINI-3-FLASH</span>
                         </div>
                       </div>
-                   </div>
-                 )}
-                 
-                 <KnowledgeGraph 
-                   nodes={graphData.nodes} 
-                   links={graphData.links} 
-                   width={800} 
-                   height={600}
-                   onNodeClick={setSelectedNode}
-                   selectedNodeId={selectedNode?.id}
-                 />
+                    )}
+
+                    {/* Node Inspector Overlay */}
+                    {selectedNode && (
+                      <div className="absolute top-4 right-4 z-20 bg-slate-900/90 backdrop-blur border border-slate-600 rounded p-4 w-64 shadow-xl">
+                          <div className="flex justify-between items-start mb-2">
+                            <span className={`text-[10px] font-bold px-1 rounded ${selectedNode.type === NodeType.Class ? 'bg-purple-900 text-purple-200' : 'bg-slate-700 text-slate-300'}`}>
+                              {selectedNode.type.toUpperCase()}
+                            </span>
+                            <button onClick={() => setSelectedNode(null)} className="text-slate-400 hover:text-white"><X size={14}/></button>
+                          </div>
+                          <h3 className="font-bold text-lg text-white mb-2">{selectedNode.label}</h3>
+                          <div className="text-xs text-slate-400 mb-2 font-mono">{selectedNode.id}</div>
+                          
+                          <div className="border-t border-slate-700 pt-2 mt-2">
+                            <h4 className="text-[10px] font-bold text-slate-500 uppercase mb-1">Connections</h4>
+                            <div className="space-y-1 max-h-40 overflow-y-auto">
+                              {filteredLinks
+                                .filter(l => (typeof l.source === 'object' ? (l.source as any).id : l.source) === selectedNode.id)
+                                .map((l, i) => (
+                                  <div key={i} className="text-[11px] text-slate-300">
+                                    <span className={l.isOntologyLink ? "text-purple-400" : "text-blue-400"}>→ {l.predicate}</span> {(l.target as any).label || l.target}
+                                  </div>
+                                ))
+                              }
+                              {filteredLinks
+                                .filter(l => (typeof l.target === 'object' ? (l.target as any).id : l.target) === selectedNode.id)
+                                .map((l, i) => (
+                                  <div key={i} className="text-[11px] text-slate-300">
+                                    <span className={l.isOntologyLink ? "text-purple-400" : "text-green-400"}>← {l.predicate}</span> {(l.source as any).label || l.source}
+                                  </div>
+                                ))
+                              }
+                            </div>
+                          </div>
+                      </div>
+                    )}
+                    
+                    <KnowledgeGraph 
+                      nodes={filteredNodes} 
+                      links={filteredLinks} 
+                      width={800} 
+                      height={600}
+                      onNodeClick={setSelectedNode}
+                      selectedNodeId={selectedNode?.id}
+                      searchTerm={searchTerm}
+                    />
+                 </div>
               </div>
-            ) : (
+            )}
+
+            {activeTab === 'shacl' && (
+              <div className="flex-1 bg-slate-950 flex flex-col p-6">
+                <div className="mb-6">
+                   <h2 className="text-xl font-bold text-purple-400 flex items-center gap-2 mb-2">
+                     <ScanSearch size={24} /> SHACL Pattern Recognition Studio
+                   </h2>
+                   <p className="text-slate-400 text-sm">
+                     Define a semantic pattern (Shape) and deploy an agent to find matching entities across the global web.
+                   </p>
+                </div>
+
+                <div className="grid grid-cols-1 gap-6">
+                   <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
+                      <h3 className="text-sm font-bold text-slate-200 mb-3 flex items-center gap-2">
+                        <Code size={14} className="text-green-400" /> Pattern Definition (Natural Language or Pseudo-SHACL)
+                      </h3>
+                      <form onSubmit={handleShaclScan}>
+                        <textarea 
+                          value={shaclQuery}
+                          onChange={(e) => setShaclQuery(e.target.value)}
+                          placeholder="Example: Find all shipping companies (Organization) that have been sanctioned by the EU in 2024 (Event)."
+                          className="w-full h-32 bg-slate-950 border border-slate-700 rounded p-3 text-sm font-mono text-green-300 focus:outline-none focus:border-green-500 resize-none mb-4"
+                        />
+                        <div className="flex justify-end">
+                           <button 
+                             type="submit"
+                             disabled={isShaclScanning || !shaclQuery}
+                             className={`px-4 py-2 rounded text-sm font-bold flex items-center gap-2 ${
+                               isShaclScanning 
+                               ? 'bg-slate-800 text-slate-500 cursor-not-allowed' 
+                               : 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-900/20'
+                             }`}
+                           >
+                             {isShaclScanning ? <RefreshCw size={16} className="animate-spin" /> : <Zap size={16} />}
+                             {isShaclScanning ? "DEPLOYING AGENTS..." : "EXECUTE PATTERN SEARCH"}
+                           </button>
+                        </div>
+                      </form>
+                   </div>
+                   
+                   <div className="bg-slate-900 border border-slate-800 rounded-lg p-4">
+                      <h3 className="text-sm font-bold text-slate-500 mb-2 uppercase">Recent Patterns</h3>
+                      <div className="space-y-2">
+                         <div className="text-xs font-mono text-slate-400 p-2 bg-slate-950 rounded cursor-pointer hover:text-white" onClick={() => setShaclQuery("Find Organizations involved in Deep Sea Mining and their funding sources.")}>
+                           Shape: Organization -> activeIn -> DeepSeaMining
+                         </div>
+                         <div className="text-xs font-mono text-slate-400 p-2 bg-slate-950 rounded cursor-pointer hover:text-white" onClick={() => setShaclQuery("Identify Politicians who have publicly denied climate change in the last month.")}>
+                            Shape: Person -> hasStance -> ClimateDenial
+                         </div>
+                      </div>
+                   </div>
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'ontology' && (
               <div className="flex-1 p-4 overflow-auto bg-slate-950 font-mono text-xs text-green-400">
                 <pre>{JSON.stringify(graphData, null, 2)}</pre>
               </div>

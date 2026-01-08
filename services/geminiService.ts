@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
 import { GraphNode, GraphLink, NodeType, NewsArticle } from '../types';
 
@@ -108,20 +109,102 @@ export const fetchGlobalIntel = async (topic?: string): Promise<NewsArticle[]> =
 };
 
 /**
- * Extracts Knowledge Graph entities and triples from a text.
+ * Generates the initial Domain Ontology (T-Box) based on the topic.
+ * This ensures the schema exists before instances are mapped.
  */
-export const extractKnowledgeGraph = async (text: string): Promise<{ nodes: GraphNode[], links: GraphLink[] }> => {
+export const generateDomainOntology = async (topic: string): Promise<{ nodes: GraphNode[], links: GraphLink[] }> => {
+  const ai = initAi();
+  if (!ai) throw new Error("API Key not found");
+
+  const prompt = `
+    You are an Ontology Engineer. Create a high-level Domain Ontology (T-Box) for the topic: "${topic}".
+    
+    Return a set of Nodes representing OWL Classes (e.g., if topic is "Ocean", classes might be "Vessel", "Port", "Storm").
+    Return Links representing relationships between these classes (rdfs:subClassOf, owl:disjointWith, etc).
+    
+    Keep it concise: 5-8 key classes max.
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            nodes: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  label: { type: Type.STRING },
+                  type: { type: Type.STRING, enum: [NodeType.Class] }
+                }
+              }
+            },
+            links: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  source: { type: Type.STRING },
+                  target: { type: Type.STRING },
+                  predicate: { type: Type.STRING },
+                  label: { type: Type.STRING }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    let data: any;
+    try {
+       data = JSON.parse(response.text || '{"nodes": [], "links": []}');
+    } catch(e) {
+       data = { nodes: [], links: [] };
+    }
+    
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    const rawLinks = Array.isArray(data.links) ? data.links : [];
+    const links = rawLinks.map((l: any) => ({ ...l, isOntologyLink: true }));
+
+    return { nodes, links };
+  } catch (e) {
+    console.error("Domain Ontology Gen Failed", e);
+    return { nodes: [], links: [] };
+  }
+};
+
+/**
+ * Extracts Knowledge Graph entities and triples from a text.
+ * Accepts existing ontology classes to ground the extraction in the T-Box.
+ */
+export const extractKnowledgeGraph = async (text: string, existingClasses: string[] = []): Promise<{ nodes: GraphNode[], links: GraphLink[] }> => {
   const ai = initAi();
   if (!ai) throw new Error("API Key not found");
 
   const modelId = "gemini-3-flash-preview";
+  
+  const ontologyContext = existingClasses.length > 0 
+    ? `Map entities to these existing OWL Classes where possible using 'rdf:type': ${existingClasses.join(', ')}.` 
+    : "";
+
   const prompt = `
     Analyze the following intelligence text and extract a Knowledge Graph in RDF/OWL style.
     
     Text: "${text}"
     
+    ${ontologyContext}
+    
     Identify key entities (Person, Organization, Location, Event, Concept).
-    Identify relationships between them using standard ontology predicates where possible (e.g., foaf:knows, org:memberOf, prov:wasStartedBy, spatial:locatedIn).
+    Identify relationships between them.
+    
+    IMPORTANT: If you identify an entity that belongs to one of the provided Classes, create a link: { source: "EntityID", target: "ClassID", predicate: "rdf:type" }.
     
     Format as JSON.
   `;
@@ -172,12 +255,225 @@ export const extractKnowledgeGraph = async (text: string): Promise<{ nodes: Grap
     }
 
     const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
-    const links = Array.isArray(data?.links) ? data.links : [];
+    let links = Array.isArray(data?.links) ? data.links : [];
+
+    // --- HEURISTIC LINKING START ---
+    // If a node doesn't have an explicit link, attempt to link it to a parent Class based on its type.
+    // This solves the "orphan node" problem.
+    nodes.forEach((node: GraphNode) => {
+      // Don't link classes to themselves or other classes in this heuristics step
+      if (node.type === NodeType.Class) return;
+
+      // Check if this node already has an outgoing rdf:type link
+      const hasTypeLink = links.some((l: any) => l.source === node.id && l.predicate === 'rdf:type');
+      
+      if (!hasTypeLink) {
+        // Try to find a matching Class in existingClasses or standard types
+        // The node.type itself (e.g. "Person") is usually a valid Class ID in our schema
+        const targetClassId = node.type;
+        
+        // We link it if it's a known type
+        if (targetClassId) {
+            links.push({
+                source: node.id,
+                target: targetClassId,
+                predicate: 'rdf:type',
+                label: 'type',
+                isOntologyLink: true
+            });
+        }
+      }
+    });
+    // --- HEURISTIC LINKING END ---
+
+    // Post-process links to identify ontology links
+    links = links.map((l: any) => ({
+       ...l,
+       isOntologyLink: l.predicate === 'rdf:type' || l.predicate === 'rdfs:subClassOf' || existingClasses.includes(l.target)
+    }));
 
     return { nodes, links };
 
   } catch (error) {
     console.error("Gemini KG Extraction Error:", error);
+    return { nodes: [], links: [] };
+  }
+};
+
+/**
+ * Generates the T-Box (Ontology Layer) for the current graph.
+ * Creates Class nodes and links them to existing A-Box nodes via rdf:type.
+ */
+export const generateOntologyLayer = async (currentNodes: GraphNode[]): Promise<{ nodes: GraphNode[], links: GraphLink[] }> => {
+  const ai = initAi();
+  if (!ai) throw new Error("API Key not found");
+  
+  if (currentNodes.length === 0) return { nodes: [], links: [] };
+
+  // Only take a sample if too large to avoid token limits
+  const sampleNodes = currentNodes.slice(0, 30);
+  const nodeSummary = sampleNodes.map(n => `${n.id} (${n.type})`).join(", ");
+
+  const prompt = `
+    Given these Knowledge Graph instances (A-Box):
+    [${nodeSummary}]
+
+    Generate the Ontology Layer (T-Box):
+    1. Identify the high-level OWL Classes for these instances (e.g. 'GeopoliticalEntity', 'NonStateActor', 'CyberIncident').
+    2. Create relationships for 'rdf:type' linking the instance ID to the Class ID.
+    3. Create relationships between Classes if obvious (e.g. 'CyberIncident' rdfs:subClassOf 'SecurityEvent').
+
+    Return as JSON nodes/links.
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            nodes: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  label: { type: Type.STRING },
+                  type: { type: Type.STRING, enum: [NodeType.Class] } // Force type Class
+                }
+              }
+            },
+            links: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  source: { type: Type.STRING },
+                  target: { type: Type.STRING },
+                  predicate: { type: Type.STRING },
+                  label: { type: Type.STRING }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+    
+    let data: any;
+    try {
+       data = JSON.parse(response.text || '{"nodes": [], "links": []}');
+    } catch(e) {
+       data = { nodes: [], links: [] };
+    }
+
+    const rawLinks = Array.isArray(data.links) ? data.links : [];
+    // Mark links as ontology links for styling
+    const links = rawLinks.map((l: any) => ({ ...l, isOntologyLink: true }));
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+
+    return { nodes, links };
+
+  } catch (e) {
+    console.error("Ontology generation failed", e);
+    return { nodes: [], links: [] };
+  }
+};
+
+/**
+ * SHACL Pattern Search Agent
+ * Scans the web for entities matching a specific SHACL shape/rule.
+ */
+export const performShaclScan = async (shaclDescription: string): Promise<{ nodes: GraphNode[], links: GraphLink[] }> => {
+  const ai = initAi();
+  if (!ai) throw new Error("API Key not found");
+
+  const prompt = `
+    You are a SHACL Pattern Recognition Agent.
+    
+    User Pattern Request: "${shaclDescription}"
+    
+    1. Search the web to find REAL entities that match this description.
+    2. Model the findings as a Knowledge Graph.
+    3. CRITICAL: Ensure you find the entities (Nodes) and how they relate (Links) to satisfy the pattern.
+    4. CRITICAL: Do not create orphaned nodes. If you find a 'Person', link them to their 'Organization' or 'Location'. If you find an 'Event', link it to 'Participants'.
+    5. Always attempt to link new entities to high-level classes like 'Person', 'Organization', or 'Location' via 'rdf:type' if no other specific parent exists.
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: prompt,
+      config: {
+        tools: [{ googleSearch: {} }],
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            nodes: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  label: { type: Type.STRING },
+                  type: { type: Type.STRING, enum: Object.values(NodeType) }
+                }
+              }
+            },
+            links: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  source: { type: Type.STRING },
+                  target: { type: Type.STRING },
+                  predicate: { type: Type.STRING },
+                  label: { type: Type.STRING }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    let data: any;
+    try {
+        data = JSON.parse(response.text || '{"nodes": [], "links": []}');
+    } catch(e) {
+        data = { nodes: [], links: [] };
+    }
+    
+    const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
+    let links = Array.isArray(data?.links) ? data.links : [];
+
+    // --- HEURISTIC LINKING FOR SHACL ---
+    // SHACL often produces lists of entities. We must tether them to the graph.
+    nodes.forEach((node: GraphNode) => {
+      if (node.type === NodeType.Class) return;
+      
+      const hasTypeLink = links.some((l: any) => l.source === node.id && l.predicate === 'rdf:type');
+      
+      if (!hasTypeLink) {
+        // Automatically link to its type Class
+        links.push({
+            source: node.id,
+            target: node.type, // e.g., "Organization"
+            predicate: 'rdf:type',
+            label: 'type',
+            isOntologyLink: true
+        });
+      }
+    });
+
+    return { nodes, links };
+
+  } catch (e) {
+    console.error("SHACL Scan failed", e);
     return { nodes: [], links: [] };
   }
 };

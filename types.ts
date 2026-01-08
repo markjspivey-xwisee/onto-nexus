@@ -1,3 +1,5 @@
+
+
 // Ontology and Graph Types
 
 export enum NodeType {
@@ -7,7 +9,8 @@ export enum NodeType {
   Event = 'Event',
   Concept = 'Concept',
   Document = 'Document', // e.g., NewsArticle
-  Artifact = 'Artifact'
+  Artifact = 'Artifact',
+  Class = 'Class' // T-Box Ontology Node
 }
 
 export interface GraphNode {
@@ -18,6 +21,8 @@ export interface GraphNode {
   // For D3
   x?: number;
   y?: number;
+  vx?: number;
+  vy?: number;
   fx?: number | null;
   fy?: number | null;
 }
@@ -27,6 +32,7 @@ export interface GraphLink {
   target: string | GraphNode;
   predicate: string; // e.g., prov:wasDerivedFrom, schema:organizer
   label: string; // Readable label for the predicate
+  isOntologyLink?: boolean; // True if this is an rdf:type or subclassOf link
 }
 
 export interface NewsArticle {
@@ -67,4 +73,11 @@ export interface Alert {
 export interface KnowledgeGraphData {
   nodes: GraphNode[];
   links: GraphLink[];
+}
+
+export interface ShaclPattern {
+  name: string;
+  description: string;
+  targetClass: string; // e.g. "Organization"
+  rules: string[]; // e.g. "Must have relation to SanctionedCountry"
 }
