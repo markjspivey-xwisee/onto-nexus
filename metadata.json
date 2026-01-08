@@ -1,0 +1,5 @@
+{
+  "name": "OntoNexus: Global Situational Awareness",
+  "description": "A semantic command center leveraging RDF, OWL, and PROV ontologies to visualize global news events as a knowledge graph for shared group situational awareness.",
+  "requestFramePermissions": []
+}
